@@ -1,0 +1,15 @@
+@echo off
+echo 正在启动 智能学习平台...
+echo.
+
+:: 启动后端
+start "Tutor Server" cmd /k "cd /d %~dp0 && python server.py"
+
+:: 等待3秒让server启动
+timeout /t 3 /nobreak > nul
+
+:: 启动前端
+start "Tutor App" cmd /k "cd /d %~dp0 && streamlit run app.py"
+
+echo 启动完成！浏览器将自动打开。
+echo 关闭系统请直接关闭两个终端窗口。

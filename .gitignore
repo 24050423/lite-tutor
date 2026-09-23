@@ -1,0 +1,30 @@
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+
+# ── 本机私有配置：里面有密钥，绝不能提交 ────────────────────────────────
+# 仓库是公开的，密钥一旦进了提交历史就删不干净，只能作废重发。
+# 照着 local_secrets.example.py 建自己的那份。
+local_secrets.py
+.env
+.env.*
+
+# ── 运行时数据：每个人自己机器上生成，克隆下来的人不需要 ────────────────
+# chat_db.json      对话记录
+# learning_db.json  答题记录（掌握曲线 / 错题本的数据源）
+# ui_settings.json  界面偏好
+# documents_db.json 资料元数据
+# documents/        上传的资料原件与预览 PDF
+# chroma_db/        向量库本体
+# chroma_db.bak-*/  rebuild_index.py 重建前的备份
+chat_db.json
+learning_db.json
+ui_settings.json
+documents_db.json
+documents/
+chroma_db/
+chroma_db.bak-*/
+
+# ── 本机工作产物 ────────────────────────────────────────────────────────
+2019-2020-2A_OS_extracted.txt
+*.bak-*
