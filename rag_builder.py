@@ -7,6 +7,7 @@ from chromadb.utils import embedding_functions
 import urllib.request
 import urllib.error
 import uuid
+from dataclasses import dataclass
 
 # ── 分词 ────────────────────────────────────────────────────
 # 中文没有空格，早先那句 re.split(r"[^a-zA-Z0-9一-鿿]+") 会把整句话切成一个 token，
@@ -15,6 +16,23 @@ import uuid
 _CJK = "一-鿿㐀-䶿"
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[" + _CJK + "]+")
 _DOTTED_NUMBER_RE = re.compile(r"(?<![a-zA-Z0-9_])(?:v)?\d+(?:\.\d+)+(?![a-zA-Z0-9_]|\.\d)", re.IGNORECASE)
+DOCUMENT_CHUNK = "document_chunk"
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    chunk_id: str
+    text: str
+    source: str
+    doc_id: str | None
+    page: int | None
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    hits: list[SearchHit]
+    confidence: float
+    keyword_only: bool = False
 
 
 def tokenize(text) -> list:
@@ -92,35 +110,55 @@ class LocalRAGKnowledgeBase:
     # 项目已更名为「智能学习平台」，但此处保持原名以兼容既有 chroma_db 数据。
     def __init__(self, db_path="./chroma_db", collection_name="lite_tutor_kb"):
         print("[SYSTEM] Initializing Local Vector Database...")
-        # Persist the database locally in the project folder
         self.client = chromadb.PersistentClient(path=db_path)
-        
         mode = (os.getenv("TUTOR_OFFLINE") or os.getenv("LITETUTOR_OFFLINE") or "auto").strip().lower()
         force_offline = mode in {"1", "true", "yes", "offline"}
         force_online = mode in {"0", "false", "no", "online"}
-        mode_label = "offline"
-        if force_offline:
+        self.embedding_error = ""
+        try:
+            existing = self.client.get_collection(collection_name, embedding_function=None)
+        except chromadb.errors.NotFoundError:
+            existing = None
+
+        if existing is None:
             self.embedding_fn = HashEmbeddingFunction()
-        else:
-            allow_online = force_online or _can_reach("https://huggingface.co")
-            if allow_online:
+            if not force_offline and (force_online or _can_reach("https://huggingface.co")):
                 try:
-                    self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-                        model_name="all-MiniLM-L6-v2"
-                    )
-                    mode_label = "online"
-                except Exception:
-                    self.embedding_fn = HashEmbeddingFunction()
-            else:
-                self.embedding_fn = HashEmbeddingFunction()
-        print(f"[SYSTEM] Embedding mode: {mode_label}")
-        
-        # Create or load the collection
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=self.embedding_fn
-        )
-        print(f"[SUCCESS] Connected to collection: {collection_name}")
+                    self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction()
+                except Exception as exc:
+                    print(f"[RAG] 新库使用哈希嵌入，句向量加载失败：{type(exc).__name__}")
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name, embedding_function=self.embedding_fn,
+            )
+        else:
+            self.embedding_fn = self._existing_embedding(existing, force_offline)
+            self.collection = (self.client.get_collection(collection_name, embedding_function=self.embedding_fn)
+                               if self.embedding_fn is not None else existing)
+        if self.embedding_error:
+            print(f"[RAG] {self.embedding_error}，仅关键词检索")
+        else:
+            print(f"[RAG] 知识库已连接，嵌入：{self.embedding_fn.name()}")
+
+    def _existing_embedding(self, collection, force_offline: bool):
+        config = collection.configuration_json.get("embedding_function") or {}
+        name = config.get("name")
+        if name == "sentence_transformer":
+            if force_offline:
+                self.embedding_error = "现有知识库使用句向量，离线设置下仅可读取正文"
+                return None
+            try:
+                factory = embedding_functions.SentenceTransformerEmbeddingFunction
+                return factory.build_from_config(config["config"]) if config.get("config") else factory()
+            except Exception as exc:
+                self.embedding_error = f"现有知识库的句向量模型加载失败（{type(exc).__name__}）"
+                return None
+        if name in (None, "hash-embedding"):
+            candidate = HashEmbeddingFunction()
+            sample = collection.get(limit=1, include=["embeddings"])["embeddings"]
+            if sample is None or not len(sample) or len(sample[0]) == candidate.dim:
+                return candidate
+        self.embedding_error = "现有知识库的嵌入配置与当前版本不兼容"
+        return None
 
     def ingest_text_file(self, file_path: str, chunk_size: int = 500):
         """Reads a text file, chunks it, and upserts to the vector database."""
@@ -153,55 +191,72 @@ class LocalRAGKnowledgeBase:
         identifiers = _DOTTED_NUMBER_RE.findall(text.lower())
         return set(tokenize(_DOTTED_NUMBER_RE.sub(" ", text))) | set(identifiers)
 
-    def _where(self, source):
-        """把「只在这份资料里检索」翻译成 Chroma 的 where 条件；不限定时返回 None。"""
-        return {"source": source} if source else None
+    @staticmethod
+    def _search_where(source=None, published: dict[str, str] | None = None) -> dict:
+        clauses = [{"type": {"$ne": "fingerprint"}}]
+        if source:
+            clauses.append({"source": source})
+        if published is not None:
+            legacy = {"type": {"$ne": DOCUMENT_CHUNK}}
+            if published:
+                legacy = {"$and": [legacy, {"source": {"$nin": list(published)}}]}
+                clauses.append({"$or": [legacy, {"doc_id": {"$in": list(published.values())}}]})
+            else:
+                clauses.append(legacy)
+        return {"$and": clauses} if len(clauses) > 1 else clauses[0]
 
-    def _keyword_scores(self, query_text: str, source=None):
+    @staticmethod
+    def _hits(ids, documents, metadatas):
+        for chunk_id, text, meta in zip(ids, documents, metadatas):
+            if not text or text.startswith("__fingerprint__"):
+                continue
+            meta = meta or {}
+            yield SearchHit(chunk_id, text, meta.get("source") or "未知资料",
+                            meta.get("doc_id"), meta.get("page"))
+
+    def _keyword_hits(self, query_text: str, where: dict):
         query_tokens = self._keyword_tokens(query_text)
         if not query_tokens:
             return []
-        all_docs = self.collection.get(include=["documents"], where=self._where(source))["documents"]
+        rows = self.collection.get(include=["documents", "metadatas"], where=where)
         scores = []
-        for doc in all_docs or []:
-            if not doc or doc.startswith("__fingerprint__"):
-                continue
-            matches = query_tokens & self._keyword_tokens(doc)
+        for hit in self._hits(rows["ids"], rows["documents"], rows["metadatas"]):
+            matches = query_tokens & self._keyword_tokens(hit.text)
             if matches:
-                scores.append((doc, len(matches) / len(query_tokens)))
+                scores.append((hit, len(matches) / len(query_tokens)))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
 
-    def _vector_distances(self, query_text: str, n_results: int, source=None):
-        where = {"type": {"$ne": "fingerprint"}}
-        if source:
-            where = {"$and": [where, self._where(source)]}
+    def _vector_hits(self, query_text: str, n_results: int, where: dict):
+        if self.embedding_fn is None:
+            return None
         try:
             results = self.collection.query(
                 query_texts=[query_text], n_results=n_results, where=where,
-                include=["documents", "distances"],
+                include=["documents", "metadatas", "distances"],
             )
         except Exception as exc:
             print(f"[SEARCH] 向量检索失败：{type(exc).__name__}")
             return None
-        return [
-            (doc, distance)
-            for doc, distance in zip(results["documents"][0], results["distances"][0])
-            if doc and not doc.startswith("__fingerprint__")
-        ]
+        ids = results["ids"][0]
+        distances = dict(zip(ids, results["distances"][0]))
+        return [(hit, distances[hit.chunk_id]) for hit in
+                self._hits(ids, results["documents"][0], results["metadatas"][0])]
 
     def query_knowledge_chunks(self, query_text: str, n_results: int = 2, source=None):
-        candidates = self._vector_distances(query_text, n_results, source)
+        where = self._search_where(source)
+        candidates = self._vector_hits(query_text, n_results, where)
         if candidates is None:
-            candidates = self._keyword_scores(query_text, source)[:n_results]
-        return [doc for doc, _ in candidates]
+            candidates = self._keyword_hits(query_text, where)[:n_results]
+        return [hit.text for hit, _ in candidates]
 
     def query_knowledge_chunks_with_scores(self, query_text: str, n_results: int = 2, source=None):
-        candidates = self._vector_distances(query_text, n_results, source)
+        where = self._search_where(source)
+        candidates = self._vector_hits(query_text, n_results, where)
         if candidates is None:
-            candidates = [(doc, 1.0 / score - 1.0)
-                          for doc, score in self._keyword_scores(query_text, source)[:n_results]]
-        return [doc for doc, _ in candidates], [distance for _, distance in candidates]
+            candidates = [(hit, 1.0 / score - 1.0)
+                          for hit, score in self._keyword_hits(query_text, where)[:n_results]]
+        return [hit.text for hit, _ in candidates], [distance for _, distance in candidates]
 
     def query_knowledge(self, query_text: str, n_results: int = 2, source=None) -> str:
         chunks = self.query_knowledge_chunks(query_text, n_results, source)
@@ -209,28 +264,38 @@ class LocalRAGKnowledgeBase:
             return "No relevant context found in the local knowledge base."
         return "\n---\n".join(chunks)
 
-    def search_chunks(self, query_text: str, n_results: int = 2, source=None,
-                      *, mode: str = "hybrid") -> tuple[list[str], float]:
+    def search_hits(self, query_text: str, n_results: int = 2, source=None, *, mode: str = "hybrid",
+                    published: dict[str, str] | None = None) -> SearchResult:
         """独立召回向量和关键词候选，再按名次融合已过门槛的片段。"""
         if n_results < 1 or not query_text.strip():
-            return [], 0.0
+            return SearchResult([], 0.0)
 
         threshold = float(os.getenv("RAG_CONF_THRESHOLD", "0.35"))
         hybrid = mode.lower() != "vector"
         limit = n_results * 2 if hybrid else n_results
-        distances = self._vector_distances(query_text, limit, source)
-        vector = [(doc, 1.0 / (1.0 + distance)) for doc, distance in distances or []]
-        keywords = self._keyword_scores(query_text, source)[:limit] if hybrid or distances is None else []
+        where = self._search_where(source, published)
+        distances = self._vector_hits(query_text, limit, where)
+        vector = [(hit, 1.0 / (1.0 + distance)) for hit, distance in distances or []]
+        keywords = self._keyword_hits(query_text, where)[:limit] if hybrid or distances is None else []
         confidence = max((score for _, score in keywords + vector), default=0.0)
 
         # 两路分数的含义不同。用倒数排名融合，同一片段每路只计一次。
-        combined: dict[str, float] = {}
+        combined: dict[SearchHit, float] = {}
         for candidates in (keywords, vector):
-            qualified = dict.fromkeys(doc for doc, score in candidates if score >= threshold)
-            for rank, doc in enumerate(qualified, start=1):
-                combined[doc] = combined.get(doc, 0.0) + 1.0 / (60 + rank)
+            qualified = dict.fromkeys(hit for hit, score in candidates if score >= threshold)
+            for rank, hit in enumerate(qualified, start=1):
+                combined[hit] = combined.get(hit, 0.0) + 1.0 / (60 + rank)
         ranked = sorted(combined, key=combined.__getitem__, reverse=True)
-        return ranked[:n_results], confidence
+        return SearchResult(ranked[:n_results], confidence, keyword_only=distances is None)
+
+    def search_chunks(self, query_text: str, n_results: int = 2, source=None,
+                      *, mode: str = "hybrid") -> tuple[list[str], float]:
+        result = self.search_hits(query_text, n_results, source, mode=mode)
+        return [hit.text for hit in result.hits], result.confidence
+
+    def has_content(self, published: dict[str, str]) -> bool:
+        rows = self.collection.get(limit=1, include=[], where=self._search_where(published=published))
+        return bool(rows["ids"])
 
     def query_knowledge_hybrid(self, query_text: str, n_results: int = 2, source=None) -> str:
         chunks, _ = self.search_chunks(query_text, n_results, source)
@@ -238,9 +303,40 @@ class LocalRAGKnowledgeBase:
             return "No relevant context found in the local knowledge base."
         return "\n---\n".join(chunks)
 
+    def add_document_version(self, doc_id: str, source: str, sections: list[tuple[int | None, str]]) -> int:
+        if self.embedding_fn is None:
+            raise RuntimeError(self.embedding_error)
+        chunks = []
+        metadatas = []
+        for page, text in sections:
+            # 保留页边界，同一页按固定窗口切分，并留少量重叠。
+            text = text.strip()
+            start = 0
+            while start < len(text):
+                end = min(start + 500, len(text))
+                chunks.append(text[start:end])
+                metadata = {"type": DOCUMENT_CHUNK, "source": source, "doc_id": doc_id}
+                if page is not None:
+                    metadata["page"] = page
+                metadatas.append(metadata)
+                if end == len(text):
+                    break
+                start = end - 50
+        if chunks:
+            batch_size = self.client.get_max_batch_size()
+            for start in range(0, len(chunks), batch_size):
+                end = min(start + batch_size, len(chunks))
+                self.collection.add(ids=[f"{doc_id}:{i}" for i in range(start, end)],
+                                    documents=chunks[start:end], metadatas=metadatas[start:end])
+        return len(chunks)
+
+    def delete_document_version(self, doc_id: str) -> None:
+        self.collection.delete(where={"doc_id": doc_id})
+
     def add_document(self, text: str, source: str = "uploaded") -> bool:
         """动态添加文档到知识库，返回False表示已存在"""
-        import hashlib
+        if self.embedding_fn is None:
+            raise RuntimeError(self.embedding_error)
         # 计算文档指纹
         fingerprint = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
         fp_id = f"__fingerprint__{source}"
@@ -285,31 +381,29 @@ class LocalRAGKnowledgeBase:
         return True
 
 
-    def delete_source(self, source: str) -> int:
+    def delete_source(self, source: str, *, preserve_doc_id: str | None = None) -> int:
         """删掉某个来源的全部 chunk，返回删除条数。
 
         指纹标记那条也要一起删——它记的是「这份文件已经导过了」，
         留着的话下次重新上传同名文件会被当成重复直接跳过。
         """
-        results = self.collection.get(include=["metadatas"])
-        ids = [
-            results["ids"][i]
-            for i, m in enumerate(results["metadatas"])
-            if m.get("source") == source
-        ]
+        where = {"source": source}
+        if preserve_doc_id:
+            where = {"$and": [where, {"doc_id": {"$ne": preserve_doc_id}}]}
+        ids = self.collection.get(include=[], where=where)["ids"]
         fp_id = f"__fingerprint__{source}"
-        if fp_id in results["ids"] and fp_id not in ids:
+        if fp_id not in ids and self.collection.get(ids=[fp_id], include=[])["ids"]:
             ids.append(fp_id)
         if not ids:
             return 0
         self.collection.delete(ids=ids)
         return len(ids)
 
-    def list_sources(self) -> list:
+    def list_sources(self, published: dict[str, str] | None = None) -> list:
         """列出知识库中所有文档来源"""
         try:
-            results = self.collection.get(include=["metadatas"])
-            sources = list({m.get("source", "unknown") for m in results["metadatas"]})
+            results = self.collection.get(include=["metadatas"], where=self._search_where(published=published))
+            sources = list({m.get("source", "unknown") for m in results["metadatas"] if m})
             return sources
         except Exception:
             return []

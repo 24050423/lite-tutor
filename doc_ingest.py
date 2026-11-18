@@ -9,7 +9,6 @@
 """
 import json
 import os
-import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -19,6 +18,7 @@ from typing import Optional, Tuple
 
 DOCS_DIR = Path("documents")
 DOCS_DB_PATH = Path("documents_db.json")
+DOCS_LOCK = threading.RLock()
 
 # 扩展名 -> (分类, 中文名)
 SUPPORTED_EXTS = {
@@ -42,18 +42,23 @@ except Exception:  # 非 Windows 或没装 pywin32
 # ── 文档元数据 ──────────────────────────────────────────────
 
 def load_docs_db() -> dict:
-    if DOCS_DB_PATH.exists():
-        try:
-            return json.loads(DOCS_DB_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    try:
+        return json.loads(DOCS_DB_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
 
 
 def save_docs_db(db: dict) -> None:
-    DOCS_DB_PATH.write_text(
-        json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    temporary = DOCS_DB_PATH.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(DOCS_DB_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def published_documents(db: dict) -> dict[str, str]:
+    return {meta["name"]: doc_id for doc_id, meta in db.items() if meta.get("versioned_index")}
 
 
 def doc_paths(doc_id: str, ext: str) -> Tuple[Path, Path]:
@@ -152,19 +157,20 @@ def convert_to_pdf(src: Path, dst: Path, kind: str) -> Tuple[bool, str]:
 
 # ── 正文抽取 ────────────────────────────────────────────────
 
-def _extract_pdf(path: Path) -> Tuple[str, int]:
+def _extract_pdf_pages(path: Path) -> tuple[list[tuple[int, str]], int]:
     import fitz
-    doc = fitz.open(str(path))
     parts = []
-    try:
-        for i, page in enumerate(doc):
+    with fitz.open(str(path)) as doc:
+        for number, page in enumerate(doc, start=1):
             text = page.get_text().strip()
             if text:
-                parts.append(f"【第{i + 1}页】\n{text}")
-        total = doc.page_count
-    finally:
-        doc.close()
-    return "\n\n".join(parts), total
+                parts.append((number, text))
+        return parts, doc.page_count
+
+
+def _extract_pdf(path: Path) -> Tuple[str, int]:
+    parts, total = _extract_pdf_pages(path)
+    return "\n\n".join(f"【第{page}页】\n{text}" for page, text in parts), total
 
 
 def _extract_docx(path: Path) -> Tuple[str, Optional[int]]:
@@ -179,13 +185,13 @@ def _extract_docx(path: Path) -> Tuple[str, Optional[int]]:
     return "\n".join(parts), None
 
 
-def _extract_pptx(path: Path) -> Tuple[str, int]:
+def _extract_pptx(path: Path, *, notes_only: bool = False) -> Tuple[str, int]:
     from pptx import Presentation
     prs = Presentation(str(path))
     parts = []
     for i, slide in enumerate(prs.slides):
         buf = []
-        for shape in slide.shapes:
+        for shape in ([] if notes_only else slide.shapes):
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
                     line = "".join(run.text for run in para.runs).strip()
@@ -204,7 +210,7 @@ def _extract_pptx(path: Path) -> Tuple[str, int]:
         except Exception:
             pass
         if buf:
-            parts.append(f"【第{i + 1}页】\n" + "\n".join(buf))
+            parts.append("\n".join(buf) if notes_only else f"【第{i + 1}页】\n" + "\n".join(buf))
     return "\n\n".join(parts), len(prs.slides)
 
 
@@ -241,8 +247,16 @@ def extract_text(path: Path, kind: str, pdf_path: Optional[Path] = None) -> Tupl
 
 # ── 对外主流程 ──────────────────────────────────────────────
 
+def _remove_files(*paths: Path) -> None:
+    for path in set(paths):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[DOCS] 清理资料文件失败：{type(exc).__name__}")
+
+
 def ingest(filename: str, contents: bytes, rag_db) -> dict:
-    """保存 -> 转 PDF -> 抽正文 -> 入知识库。返回给前端的结果字典。"""
+    """准备文件和索引，确认可用后发布新版本。"""
     ext = Path(filename).suffix.lower()
     if ext not in SUPPORTED_EXTS:
         return {"status": "error",
@@ -250,109 +264,112 @@ def ingest(filename: str, contents: bytes, rag_db) -> dict:
 
     kind, type_label = SUPPORTED_EXTS[ext]
     DOCS_DIR.mkdir(exist_ok=True)
-    db = load_docs_db()
-
-    # 同名视为更新：清掉旧的记录、文件和知识库切片，避免越传越乱
-    replaced = False
-    for old_id, old in list(db.items()):
-        if old.get("name") == filename:
-            _purge(old_id, old, db, rag_db)
-            replaced = True
-    if not replaced and rag_db is not None:
-        # 旧知识库里可能有同名来源却没有原件记录（历史遗留）。不先清掉的话，
-        # 它的指纹还在，add_document 会把这次上传当成重复文件直接跳过，
-        # 于是知识库里留着的还是旧正文。
-        try:
-            rag_db.delete_source(filename)
-        except Exception:
-            pass
-
-    doc_id = uuid.uuid4().hex[:8]
+    doc_id = uuid.uuid4().hex
     src_path, pdf_path = doc_paths(doc_id, ext)
-    src_path.write_bytes(contents)
+    published = False
+    try:
+        src_path.write_bytes(contents)
+        ok, reason = (True, "") if kind == "pdf" else convert_to_pdf(src_path, pdf_path, kind)
+        sections: list[tuple[int | None, str]] = []
+        pages, note = None, ""
+        if ok:
+            try:
+                page_sections, pages = _extract_pdf_pages(pdf_path)
+                sections.extend(page_sections)
+            except Exception:
+                ok, reason = False, "PDF 预览无法读取"
+        if not ok and kind != "pdf":
+            _remove_files(pdf_path)
+        if sections and ext == ".pptx":
+            try:
+                notes, _ = _extract_pptx(src_path, notes_only=True)
+                if notes:
+                    sections.append((None, notes))
+            except Exception:
+                note = "未能提取幻灯片备注"
+        if not sections and kind != "pdf":
+            text, _, note = extract_text(src_path, kind)
+            if text.strip():
+                sections = [(None, text)]
+        if not sections and not ok:
+            return {"status": "error", "message": note or reason or "未提取到正文"}
 
-    # PDF 不用转，原件就是预览件（doc_paths 对 pdf 返回的是同一个路径）
-    if kind == "pdf":
-        if src_path.resolve() != pdf_path.resolve():
-            shutil.copyfile(src_path, pdf_path)
-        ok, reason = True, ""
-    else:
-        ok, reason = convert_to_pdf(src_path, pdf_path, kind)
-        if not ok:
-            pdf_path.unlink(missing_ok=True)
+        with DOCS_LOCK:
+            db = load_docs_db()
+            old = {key: meta for key, meta in db.items() if meta.get("name") == filename}
+            if not sections:
+                old_indexed = any(meta.get("indexed") for meta in old.values())
+                if old_indexed or (rag_db is not None and filename in rag_db.list_sources(published_documents(db))):
+                    return {"status": "error", "message": "新资料未提取到正文，已保留原有知识库"}
 
-    text, pages, note = extract_text(src_path, kind, pdf_path if ok else None)
+            document = {
+                "doc_id": doc_id, "name": filename, "ext": ext, "kind": kind,
+                "type_label": type_label, "size": len(contents),
+                "uploaded_at": datetime.now().isoformat(), "pages": pages,
+                "chars": sum(len(text) for _, text in sections), "previewable": ok,
+                "preview_note": reason, "indexed": bool(sections), "note": note,
+                "versioned_index": True,
+            }
+            try:
+                if sections and (rag_db is None or not rag_db.add_document_version(doc_id, filename, sections)):
+                    raise RuntimeError("知识库不可用")
+                remaining = {key: meta for key, meta in db.items() if key not in old}
+                remaining[doc_id] = document
+                save_docs_db(remaining)
+            except Exception as exc:
+                if sections and rag_db is not None:
+                    try:
+                        rag_db.delete_document_version(doc_id)
+                    except Exception:
+                        pass  # 未发布的片段不会进入检索结果。
+                message = getattr(rag_db, "embedding_error", "") or type(exc).__name__
+                return {"status": "error", "message": f"资料发布失败，已保留原有数据（{message}）"}
+            published = True
 
-    indexed = False
-    if text.strip():
-        try:
-            indexed = bool(rag_db.add_document(text, source=filename))
-        except Exception as e:
-            note = (note + "；" if note else "") + f"入知识库失败：{e}"
-
-    db[doc_id] = {
-        "doc_id": doc_id,
-        "name": filename,
-        "ext": ext,
-        "kind": kind,
-        "type_label": type_label,
-        "size": len(contents),
-        "uploaded_at": datetime.now().isoformat(),
-        "pages": pages,
-        "chars": len(text),
-        "previewable": ok,
-        "preview_note": reason,
-        "indexed": indexed,
-        "note": note,
-    }
-    save_docs_db(db)
-
-    if not text.strip() and not ok:
-        return {"status": "error",
-                "message": f"既没能转换也没能提取正文：{reason}",
-                "document": db[doc_id]}
-    return {"status": "success", "document": db[doc_id]}
-
-
-def _purge(doc_id: str, meta: dict, db: dict, rag_db) -> None:
-    """删掉一份资料：文件、知识库切片、索引记录。调用方负责 save_docs_db。"""
-    for path in doc_paths(doc_id, meta.get("ext", "")):
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-    name = meta.get("name")
-    if name and rag_db is not None:
-        try:
-            rag_db.delete_source(name)
-        except Exception:
-            pass
-    db.pop(doc_id, None)
+            if rag_db is not None:
+                try:
+                    rag_db.delete_source(filename, preserve_doc_id=doc_id)
+                except Exception as exc:
+                    print(f"[DOCS] 清理旧索引失败：{type(exc).__name__}")
+            for old_id, meta in old.items():
+                _remove_files(*doc_paths(old_id, meta.get("ext", "")))
+        return {"status": "success", "document": document}
+    finally:
+        if not published:
+            _remove_files(src_path, pdf_path)
 
 
 def remove(doc_id: str, rag_db) -> Tuple[bool, str]:
-    db = load_docs_db()
-    meta = db.get(doc_id)
-    if not meta:
-        return False, "资料不存在"
-    name = meta.get("name", doc_id)
-    _purge(doc_id, meta, db, rag_db)
-    save_docs_db(db)
+    with DOCS_LOCK:
+        db = load_docs_db()
+        meta = db.get(doc_id)
+        if not meta:
+            return False, "资料不存在"
+        name = meta.get("name", doc_id)
+        if rag_db is not None:
+            try:
+                rag_db.delete_source(name)
+            except Exception:
+                return False, "知识库切片删除失败，资料仍保留"
+        del db[doc_id]
+        save_docs_db(db)
+        _remove_files(*doc_paths(doc_id, meta.get("ext", "")))
     return True, f"已删除《{name}》及其知识库切片"
 
 
 def remove_by_source(source_name: str, rag_db) -> Tuple[bool, str]:
     """按文件名删除——兼容旧知识库里那些没有资料记录的来源。"""
-    db = load_docs_db()
-    hit = next((i for i, m in db.items() if m.get("name") == source_name), None)
-    if hit:
-        return remove(hit, rag_db)
-    if rag_db is None:
-        return False, "资料不存在"
-    try:
-        n = rag_db.delete_source(source_name)
-    except Exception as e:
-        return False, str(e)
+    with DOCS_LOCK:
+        db = load_docs_db()
+        hit = next((i for i, m in db.items() if m.get("name") == source_name), None)
+        if hit:
+            return remove(hit, rag_db)
+        if rag_db is None:
+            return False, "资料不存在"
+        try:
+            n = rag_db.delete_source(source_name)
+        except Exception:
+            return False, "知识库切片删除失败"
     if not n:
         return False, f"知识库里没有《{source_name}》"
     return True, f"已从知识库删除《{source_name}》（{n} 个切片，无原件可清理）"
@@ -360,14 +377,12 @@ def remove_by_source(source_name: str, rag_db) -> Tuple[bool, str]:
 
 def list_all(rag_db) -> list:
     """资料库列表 = 有原件的资料 + 旧知识库里那些只能查到来源名的条目。"""
-    db = load_docs_db()
-    items = sorted(db.values(), key=lambda d: d.get("uploaded_at") or "", reverse=True)
+    with DOCS_LOCK:
+        db = load_docs_db()
+        items = sorted(db.values(), key=lambda d: d.get("uploaded_at") or "", reverse=True)
+        kb_sources = rag_db.list_sources(published_documents(db)) if rag_db else []
 
     known = {d.get("name") for d in items}
-    try:
-        kb_sources = rag_db.list_sources() if rag_db else []
-    except Exception:
-        kb_sources = []
     for s in kb_sources:
         if s in known or s.startswith("__fingerprint__"):
             continue

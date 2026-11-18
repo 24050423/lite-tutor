@@ -21,6 +21,7 @@ chat_db.json
 learning_db.json
 ui_settings.json
 documents_db.json
+documents_db.json.tmp
 documents/
 chroma_db/
 chroma_db.bak-*/
