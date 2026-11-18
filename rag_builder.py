@@ -110,7 +110,7 @@ class LocalRAGKnowledgeBase:
     # 项目已更名为「智能学习平台」，但此处保持原名以兼容既有 chroma_db 数据。
     def __init__(self, db_path="./chroma_db", collection_name="lite_tutor_kb"):
         print("[SYSTEM] Initializing Local Vector Database...")
-        self.client = chromadb.PersistentClient(path=db_path)
+        self.client = chromadb.PersistentClient(path=os.path.abspath(db_path))
         mode = (os.getenv("TUTOR_OFFLINE") or os.getenv("LITETUTOR_OFFLINE") or "auto").strip().lower()
         force_offline = mode in {"1", "true", "yes", "offline"}
         force_online = mode in {"0", "false", "no", "online"}
@@ -195,7 +195,7 @@ class LocalRAGKnowledgeBase:
     def _search_where(source=None, published: dict[str, str] | None = None) -> dict:
         clauses = [{"type": {"$ne": "fingerprint"}}]
         if source:
-            clauses.append({"source": source})
+            clauses.append({"source": {"$in": source} if isinstance(source, list) else source})
         if published is not None:
             legacy = {"type": {"$ne": DOCUMENT_CHUNK}}
             if published:

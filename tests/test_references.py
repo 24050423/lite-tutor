@@ -25,7 +25,7 @@ def pdf_bytes(*texts: str) -> bytes:
         return pdf.tobytes()
 
 
-class ReferenceTests(unittest.TestCase):
+class LocalAPITest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         with ExitStack() as stack:
@@ -55,6 +55,7 @@ class ReferenceTests(unittest.TestCase):
         self.kb = self.server.LocalRAGKnowledgeBase()
         stack.enter_context(patch.object(self.server, "rag_db", self.kb))
         stack.enter_context(patch.object(self.server, "chat_db", {}))
+        stack.enter_context(patch.object(self.server, "learning_db", {}))
         self.http = stack.enter_context(TestClient(self.server.app))
 
     def upload(self, name, contents):
@@ -63,6 +64,8 @@ class ReferenceTests(unittest.TestCase):
     def search(self, query, **options):
         return self.http.post("/search", json={"query": query, **options}).json()
 
+
+class ReferenceTests(LocalAPITest):
     def test_distinct_page_references_and_history(self):
         first = self.upload("first.pdf", pdf_bytes("Intro A", "Shared identifier 2.6.8"))
         second = self.upload("second.pdf", pdf_bytes("Intro B", "Shared identifier 2.6.8"))

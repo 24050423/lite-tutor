@@ -301,7 +301,7 @@ def _search_knowledge(base_url: str, query: str, source: str | None = None) -> d
     return {"retrieval_status": "unavailable"}
 
 
-def _document_scope(label: str, key: str, documents: list | None) -> str | None:
+def _document_scope(label: str, key: str, documents: list | None, all_label: str = "全部资料") -> str | None:
     available = list(dict.fromkeys(d["name"] for d in (documents or []) if d.get("indexed") and d.get("name")))
     previous = st.session_state.get(key)
     options = [None, *available]
@@ -310,7 +310,7 @@ def _document_scope(label: str, key: str, documents: list | None) -> str | None:
     return st.selectbox(
         label, options, key=key,
         format_func=lambda source: (
-            "全部资料" if source is None else source if source in available else f"{source}（暂不可用）"
+            all_label if source is None else source if source in available else f"{source}（暂不可用）"
         ),
     )
 
@@ -395,6 +395,56 @@ def _merge_references(references: list[dict], additional: list[dict]) -> list[di
     return merged
 
 
+def _study_post(base_url: str, path: str, payload: dict, timeout: int = 30) -> dict:
+    try:
+        response = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=timeout)
+        data = response.json()
+        if data.get("status") == "success":
+            return data
+        return {"status": "error", "message": data.get("message") or "请求内容无效"}
+    except requests.Timeout:
+        return {"status": "error", "message": "请求超时，可以重试"}
+    except Exception:
+        return {"status": "error", "message": "学习服务暂时不可用"}
+
+
+def _queue_practice(payload: dict, course_id: str | None = None) -> None:
+    st.session_state.pending_practice = payload
+    st.session_state.next_study_course = course_id
+    st.session_state.next_study_tab = "🎯 测验"
+    st.rerun()
+
+
+def _render_grade(record: dict) -> None:
+    score = record.get("score")
+    if score is not None:
+        st.caption(f"得分 {score} / 100 · 75 分通过")
+    if record.get("duplicate"):
+        st.info("这道题已提交，以下是首次提交的结果。")
+    if record.get("feedback"):
+        st.write(record["feedback"])
+    if record.get("grading_method") == "semantic":
+        st.caption("评分方式 · 模型逐项评分")
+    elif record.get("grading_method") == "keyword":
+        st.caption("评分方式 · 关键词匹配")
+    labels = {"met": "✅ 达到", "partial": "🟡 部分达到", "missed": "❌ 未达到"}
+    for item in record.get("items", []):
+        st.markdown(f"**{labels[item['status']]} · {item['keyword']}**")
+        st.write(f"评分要点 · {item['expected']}")
+        st.write(item["explanation"])
+    if not record.get("items"):
+        hits = record.get("hits", record.get("matched_keywords", []))
+        if hits:
+            st.write("命中关键词 · " + "、".join(hits))
+        missed = [word for word in record.get("keywords", []) if word not in hits]
+        if missed:
+            st.write("漏掉关键词 · " + "、".join(missed))
+
+
+def _js_data(data) -> str:
+    return json.dumps(data, ensure_ascii=True).replace("<", "\\u003c")
+
+
 def _url_session_id() -> str:
     """读取地址栏里的会话 id。刷新页面时靠它回到同一个会话。"""
     raw = st.query_params.get("sid")
@@ -428,14 +478,6 @@ if "session_id" not in st.session_state:
 if "current_question" not in st.session_state:
     st.session_state.current_question = ""
 
-if "quiz_mode" not in st.session_state:
-    st.session_state.quiz_mode = False
-if "current_quiz" not in st.session_state:
-    st.session_state.current_quiz = None
-if "quiz_keywords" not in st.session_state:
-    st.session_state.quiz_keywords = []
-if "waiting_answer" not in st.session_state:
-    st.session_state.waiting_answer = False
 if "delete_mode" not in st.session_state:
     st.session_state.delete_mode = False       # 侧边栏「删除」是个模式开关
 if "pending_delete_sid" not in st.session_state:
@@ -540,8 +582,8 @@ with st.sidebar:
         st.session_state.messages = loaded if loaded else [dict(WELCOME_MESSAGE)]
         st.session_state.loaded_sid = sid
         # 切走后旧的题目状态不该跟过来
-        st.session_state.waiting_answer = False
-        st.session_state.current_quiz = None
+        st.session_state.pop("active_practice", None)
+        st.session_state.pop("practice_grade", None)
         st.query_params["sid"] = sid
 
     # 地址栏是权威来源：刷新页面、或直接在地址栏改 sid，都以它为准
@@ -674,10 +716,21 @@ with header_right:
 st.markdown(" ")
 
 # ===================== Tab主界面 =====================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["🧭 对话学习", "🎯 测验", "📈 掌握曲线", "❌ 错题本", "🧠 思维导图", "📚 资料库"]
-)
 documents = _fetch_documents(edge_url) if edge_url.strip() else None
+course_list = (_edge_get(edge_url, "/courses") or {}).get("courses", []) if edge_url.strip() else []
+courses = {course["id"]: course for course in course_list}
+if "next_study_course" in st.session_state:
+    requested_course = st.session_state.pop("next_study_course")
+    st.session_state.study_course = requested_course if requested_course in courses else None
+course_id = st.selectbox("学习课程", [None, *courses], key="study_course",
+                         format_func=lambda item: courses[item]["name"] if item else "当前会话（含旧记录）")
+course = courses.get(course_id)
+if next_tab := st.session_state.pop("next_study_tab", None):
+    st.session_state.study_tab = next_tab
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["🧭 对话学习", "🎯 测验", "📈 掌握曲线", "❌ 错题本", "🧠 思维导图", "📚 资料库", "🗓️ 复习路径"],
+    key="study_tab", on_change="rerun",
+)
 
 # ==================== Tab1：对话 ====================
 with tab1:
@@ -887,323 +940,197 @@ with tab1:
 # ==================== Tab2：测验 ====================
 with tab2:
     st.subheader("🎯 测验模式")
+    if course:
+        topic_labels = {item["id"]: item["name"] for item in course["topics"]}
+        topic_id = st.selectbox("练习知识点", list(topic_labels), key=f"topic_{course_id}",
+                                format_func=topic_labels.__getitem__)
+        scoped_documents = [d for d in (documents or []) if d.get("name") in course["sources"]]
+        quiz_scope = _document_scope("出题范围", f"course_scope_{course_id}", scoped_documents, "课程资料")
+        quiz_request = {"course_id": course_id, "topic_id": topic_id, "source": quiz_scope}
+    else:
+        q1, q2 = st.columns([6, 4])
+        with q1:
+            quiz_topic = st.text_input("输入考察主题（如递归、哈希表）", key="quiz_topic_input")
+        with q2:
+            quiz_scope = _document_scope("出题范围", "quiz_scope_input", documents)
+        quiz_request = {"question": quiz_topic.strip(), "source": quiz_scope}
 
-    col_t1, col_t2 = st.columns([6, 4])
-    with col_t1:
-        quiz_topic = st.text_input("输入考察主题（如：SQL查询、递归、哈希表）", key="quiz_topic_input")
-    with col_t2:
-        quiz_scope = _document_scope("出题范围", "quiz_scope_input", documents)
-    col_q1, col_q2 = st.columns([2, 8])
-    with col_q1:
-        gen_btn = st.button("📝 出题", use_container_width=True)
-
-    if gen_btn and quiz_topic.strip():
-        with st.spinner("AI正在出题..."):
-            try:
-                payload = {"question": quiz_topic.strip(), "n_results": 4}
-                if quiz_scope:
-                    payload["source"] = quiz_scope
-                resp = requests.post(
-                    f"{edge_url.rstrip('/')}/quiz",
-                    json=payload,
-                    timeout=60
-                )
-                if resp.ok and resp.json().get("status") == "success":
-                    data = resp.json()
-                    st.session_state.current_quiz = data.get("quiz", "")
-                    st.session_state.quiz_keywords = data.get("keywords", [])
-                    st.session_state.current_question = quiz_topic.strip()
-                    st.session_state.quiz_ref_context = data.get("context", "")
-                    st.session_state.quiz_ref_scope = quiz_scope or ""
-                    st.session_state.quiz_references = data.get("references") or []
-                    st.session_state.waiting_answer = True
-                    st.rerun()
-                else:
-                    data = resp.json()
-                    st.error(f"出题失败：{data.get('message', resp.text)}")
-            except Exception as e:
-                st.error(f"连接失败：{e}")
-
-    if st.session_state.waiting_answer and st.session_state.current_quiz:
-        st.markdown(f"**📝 题目**\n\n{st.session_state.current_quiz}")
-        quiz_references = st.session_state.get("quiz_references") or []
-        if quiz_references:
-            st.caption("📖 出题时提供的资料片段")
-            _render_citations(quiz_references, edge_url, documents)
+    pending = st.session_state.pop("pending_practice", None)
+    if st.button("📝 出题", key="generate_practice"):
+        pending = quiz_request
+    if pending is not None:
+        with st.spinner("正在准备题目…"):
+            result = _study_post(edge_url, "/quiz", {"n_results": 4, **pending}, timeout=55)
+        if result["status"] == "success":
+            st.session_state.active_practice = result
+            st.session_state.current_question = result.get("topic") or pending.get("question", "")
+            st.session_state.pop("practice_grade", None)
         else:
-            st.caption(_referenced_note(
-                st.session_state.get("quiz_ref_scope") or "",
-                st.session_state.get("quiz_ref_context") or "",
-            ))
+            st.error(result["message"])
+            if pending.get("retry_quiz_id"):
+                st.caption("也可以直接在上方选择知识点重新出题。")
 
-        with st.form("answer_form", clear_on_submit=True):
-            user_answer = st.text_area("你的回答：", height=120, placeholder="在这里输入你的答案...")
-            col_s1, col_s2 = st.columns([2, 8])
-            with col_s1:
-                submitted = st.form_submit_button("✅ 提交答案", use_container_width=True)
-            with col_s2:
-                give_up = st.form_submit_button("🔄 换一题", use_container_width=True)
+    quiz = st.session_state.get("active_practice")
+    if quiz and quiz.get("course_id") == course_id:
+        st.markdown(f"**📝 题目**\n\n{quiz['quiz']}")
+        if quiz.get("topic"):
+            st.caption(f"知识点 · {quiz['topic']}")
+        if quiz.get("sources"):
+            st.caption("出题范围 · " + "、".join(quiz["sources"]))
+        if quiz.get("generation_method") == "template":
+            st.caption("模型出题不可用，本题使用本地模板。")
+        if quiz.get("citations"):
+            st.caption("📖 本题引用")
+            _render_citations(quiz["citations"], edge_url, documents)
+        elif quiz.get("references"):
+            st.caption("📖 出题时提供的参考片段")
+            _render_citations(quiz["references"], edge_url, documents)
+        elif quiz.get("source_type") == "provided":
+            st.caption("本题使用手动提供的背景资料。")
+        elif quiz.get("source_type") == "general":
+            st.caption("通用练习 · 本题没有课件出处。")
+        else:
+            st.caption(_referenced_note(quiz.get("source") or "", quiz.get("context") or ""))
 
-        if give_up:
-            st.session_state.waiting_answer = False
-            st.session_state.current_quiz = None
-            st.session_state.quiz_keywords = []
-            st.session_state.quiz_ref_context = ""
-            st.session_state.quiz_ref_scope = ""
-            st.session_state.quiz_references = []
+        grade = st.session_state.get("practice_grade")
+        quiz_id = quiz.get("quiz_id") or "legacy"
+        if grade is None:
+            with st.form("answer_form"):
+                answer = st.text_area("你的回答", key=f"answer_{quiz_id}", height=120, max_chars=12000)
+                submitted = st.form_submit_button("✅ 提交答案")
+            if submitted:
+                if not answer.strip():
+                    st.warning("请先填写答案。")
+                else:
+                    payload = {"answer": answer.strip(), "session_id": st.session_state.session_id}
+                    if quiz.get("quiz_id"):
+                        payload["quiz_id"] = quiz["quiz_id"]
+                    else:
+                        payload.update(question=quiz["quiz"], keywords=quiz.get("keywords", []))
+                    with st.spinner("正在逐项评分…"):
+                        result = _study_post(edge_url, "/grade", payload)
+                    if result["status"] == "success":
+                        st.session_state.practice_grade = result
+                        st.rerun()
+                    else:
+                        st.error(result["message"])
+        else:
+            if grade.get("result") == "校验通过":
+                st.success("本题通过")
+            else:
+                st.warning("本题仍需复习")
+            _render_grade(grade)
+            if quiz.get("quiz_id") and st.button("继续练习这个知识点", key="practice_again"):
+                _queue_practice({"retry_quiz_id": quiz["quiz_id"]}, quiz.get("course_id"))
 
-        if submitted and user_answer.strip():
-            with st.spinner("AI评分中..."):
-                try:
-                    grade_resp = requests.post(
-                        f"{edge_url.rstrip('/')}/grade",
-                        json={
-                            "answer": user_answer.strip(),
-                            "keywords": st.session_state.quiz_keywords,
-                            "session_id": st.session_state.session_id,
-                            "question": st.session_state.current_quiz
-                        },
-                        timeout=20
-                    )
-                    if grade_resp.ok:
-                        gdata = grade_resp.json()
-                        result = gdata.get("result", "")
-                        feedback = gdata.get("feedback", "")
-                        matched = gdata.get("matched_keywords", [])
-
-                        if result == "校验通过":
-                            st.success(f"✅ 回答正确！")
-                        else:
-                            st.error(f"❌ 回答有误")
-
-                        if feedback:
-                            st.markdown(
-                                f"""<div style="background:#fffbeb;color:#78350f;border-left:4px solid #f59e0b;
-                                border-radius:8px;padding:12px;margin:8px 0;">
-                                🤖 <b>AI点评：</b>{feedback}</div>""",
-                                unsafe_allow_html=True
-                            )
-                        if matched:
-                            st.markdown(f"**✨ 命中知识点：** {', '.join(matched)}")
-
-                        st.session_state.waiting_answer = False
-                        st.session_state.current_quiz = None
-
-                        # 再来一题按钮
-                        if st.button("➡️ 再来一题", use_container_width=False):
-                            st.rerun()
-
-                except Exception as e:
-                    st.error(f"评分失败：{e}")
+stats = _edge_get(edge_url, "/learning_stats",
+                  params={"session_id": st.session_state.session_id, **({"course_id": course_id} if course else {})})
+records = (stats or {}).get("records", [])
+topic_stats = (stats or {}).get("topics", [])
+legacy_records = [record for record in records if not record.get("topic_id")]
 
 # ==================== Tab3：掌握曲线 ====================
 with tab3:
     st.subheader("📈 知识点掌握曲线")
-    sid = st.session_state.session_id
-
-    try:
-        resp = requests.get(f"{edge_url.rstrip('/')}/learning_stats", params={"session_id": sid}, timeout=5)
-        records = resp.json().get("records", []) if resp.ok else []
-    except Exception:
-        records = []
-
-    if not records:
-        st.info("还没有答题记录，去「测验」Tab完成几道题再来看吧～")
-    else:
-        kw_stats = {}
-        for r in records:
-            for kw in r.get("keywords", []):
-                if kw not in kw_stats:
-                    kw_stats[kw] = {"total": 0, "pass": 0}
-                kw_stats[kw]["total"] += 1
-                if r["result"] == "校验通过":
-                    kw_stats[kw]["pass"] += 1
-
-        if kw_stats:
-            labels = list(kw_stats.keys())
-            values = [round(kw_stats[k]["pass"] / kw_stats[k]["total"] * 100) for k in labels]
-
-            chart_html = f"""
-            <div id="curve_chart" style="width:100%;height:380px;"></div>
-            <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-            <script>
-            var chart = echarts.init(document.getElementById('curve_chart'));
-            chart.resize();
-            window.addEventListener('resize', function(){{ chart.resize(); }});
-
-            chart.setOption({{
-                backgroundColor: 'transparent',
-                tooltip: {{ trigger: 'axis' }},
-                xAxis: {{
-                    type: 'category',
-                    data: {json.dumps(labels, ensure_ascii=False)},
-                    axisLabel: {{ color: '{chart_text}', rotate: 30 }}
-                }},
-                yAxis: {{
-                    type: 'value', min: 0, max: 100,
-                    axisLabel: {{ color: '{chart_text}', formatter: '{{value}}%' }}
-                }},
-                series: [{{
-                    name: '掌握度',
-                    type: 'line',
-                    data: {json.dumps(values)},
-                    smooth: true,
-                    symbol: 'circle',
-                    symbolSize: 8,
-                    lineStyle: {{ color: '{accent}', width: 3 }},
-                    itemStyle: {{ color: '{accent}' }},
-                    areaStyle: {{ color: '{_hex_to_rgba(accent, 0.12)}' }}
-                }}]
-            }});
-            </script>
-            """
-            components.html(chart_html, height=400)
-
-            # 只显示掌握度不足100%的知识点，最多显示12个
-            weak_indices = [i for i, v in enumerate(values) if v < 100]
-            if not weak_indices:
-                weak_indices = list(range(min(len(labels), 8)))
-            display_indices = weak_indices[:12]
-            
-            if display_indices:
-                st.markdown("**⚠️ 需要加强的知识点：**")
-            cols = st.columns(min(len(display_indices), 4))
-            for idx, i in enumerate(display_indices):
-                kw = labels[i]
-                with cols[idx % 4]:
-                    pct = values[i]
-                    color = "#4caf50" if pct >= 70 else "#ff9800" if pct >= 40 else "#f44336"
-                    st.markdown(
-                        f'<div style="background:{card_bg};border:1px solid {color};border-radius:10px;padding:10px;text-align:center;margin:4px 0;">'
-                        f'<div style="color:{color};font-size:1.4em;font-weight:bold;">{pct}%</div>'
-                        f'<div style="color:{chart_text};font-size:0.85em;">{kw}</div></div>',
-                        unsafe_allow_html=True
-                    )
+    if stats is None:
+        st.info("暂时无法读取学习记录。")
+    elif not records:
+        st.info("还没有答题记录。完成一道测验后即可查看知识点情况。")
+    if topic_stats:
+        labels = [item["name"] for item in topic_stats]
+        # 同名但不同课程的知识点按 ID 统计，横轴用课程名称辅助辨认。
+        if len(set(labels)) != len(labels):
+            by_topic = {item["topic_id"]: item.get("course_id") for item in records if item.get("topic_id")}
+            labels = [f"{item['name']} · {courses.get(by_topic[item['id']], {}).get('name', '独立练习')}"
+                      for item in topic_stats]
+        values = [round(item["passed"] / item["total"] * 100) for item in topic_stats]
+        components.html(f"""
+        <div id="curve_chart" style="width:100%;height:380px;"></div>
+        <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+        <script>
+        var chart = echarts.init(document.getElementById('curve_chart'));
+        window.addEventListener('resize', function(){{ chart.resize(); }});
+        chart.setOption({{
+            tooltip: {{ trigger: 'axis' }},
+            xAxis: {{type: 'category', data: {_js_data(labels)}, axisLabel: {{color: '{chart_text}', rotate: 30}}}},
+            yAxis: {{type: 'value', min: 0, max: 100, axisLabel: {{color: '{chart_text}', formatter: '{{value}}%'}}}},
+            series: [{{name: '练习通过率', type: 'line', data: {_js_data(values)}, symbolSize: 8,
+                      itemStyle: {{color: '{accent}'}}}}]
+        }});
+        </script>
+        """, height=400)
+        for item, label, value in zip(topic_stats, labels, values):
+            st.write(f"{label} · {value}%（{item['passed']} / {item['total']} 次通过）")
+    if legacy_records:
+        with st.expander(f"待归类的旧练习 · {len(legacy_records)} 条"):
+            for record in legacy_records:
+                st.write(record.get("question") or "未记录题目", record.get("result") or "")
 
 # ==================== Tab4：错题本 ====================
 with tab4:
     st.subheader("❌ 错题本")
-    try:
-        resp = requests.get(f"{edge_url.rstrip('/')}/learning_stats", params={"session_id": st.session_state.session_id}, timeout=5)
-        records = resp.json().get("records", []) if resp.ok else []
-    except Exception:
-        records = []
-
-    wrong = [r for r in records if r["result"] != "校验通过"]
-
-    if not wrong:
-        st.success("太棒了，暂时没有错题！")
-    else:
-        st.markdown(f"共 **{len(wrong)}** 道错题")
-        for i, r in enumerate(wrong, 1):
-            with st.expander(f"错题 {i}：{r['question'][:40] if r['question'] else '（无题目记录）'}"):
-                st.markdown(f"**🕐 时间：** {r['timestamp'][:19].replace('T', ' ')}")
-                st.markdown(f"**❓ 题目关键词：** {', '.join(r['keywords']) if r['keywords'] else '无'}")
-                st.markdown(f"**✍️ 你的回答：** {r['answer']}")
-                st.markdown(f"**✅ 命中关键词：** {', '.join(r['hits']) if r['hits'] else '无'}")
-                missed = [k for k in r['keywords'] if k not in r['hits']]
-                if missed:
-                    st.markdown(f"**💡 漏掉的关键词：** {', '.join(missed)}")
-                if r.get("feedback"):
-                    st.markdown(
-                        f"""<div style="background:#fffbeb;color:#78350f;border-left:4px solid #f59e0b;
-                        border-radius:8px;padding:10px;margin:6px 0;">
-                        🤖 <b>AI点评：</b>{r['feedback']}</div>""",
-                        unsafe_allow_html=True
-                    )
-                if st.button(f"🔁 重新练习", key=f"retry_{i}"):
-                    retry_q = r.get("question", "")
-                    if retry_q:
-                        st.session_state.messages.append({
-                            "role": "user",
-                            "content": f"请出一道关于「{retry_q}」相关知识点的新题目考我"
-                        })
-                        st.session_state.current_question = retry_q
-                        _persist_chat(edge_url, st.session_state.session_id, st.session_state.messages)
-                        st.info("已发送练习请求，请切换到「对话学习」Tab查看新题目！")
+    wrong = [record for record in reversed(records) if record.get("result") != "校验通过"]
+    if stats is None:
+        st.info("暂时无法读取错题。")
+    elif not wrong:
+        st.info("当前范围内没有错题。")
+    for number, record in enumerate(wrong, start=1):
+        question = record.get("question") or ""
+        topic = record.get("topic") or "待归类"
+        with st.expander(f"{number}. {topic} · {question[:50] or '未记录题目'}"):
+            st.write(question)
+            st.caption((record.get("timestamp") or "")[:19].replace("T", " "))
+            st.write("你的回答")
+            st.write(record.get("answer", ""))
+            _render_grade(record)
+            _render_citations(record.get("citations") or [], edge_url, documents)
+            if (record.get("quiz_id") or question) and st.button("🔁 同知识点重练", key=f"retry_{number}"):
+                if record.get("quiz_id"):
+                    payload = {"retry_quiz_id": record["quiz_id"]}
+                else:
+                    payload = {"question": (record.get("topic") or question)[:1000],
+                               "avoid_question": question[:2000], "source": record.get("source")}
+                _queue_practice(payload, record.get("course_id"))
 
 # ==================== Tab5：思维导图 ====================
 with tab5:
     st.subheader("🧠 知识点思维导图")
-    try:
-        resp = requests.get(f"{edge_url.rstrip('/')}/learning_stats", params={"session_id": st.session_state.session_id}, timeout=5)
-        records = resp.json().get("records", []) if resp.ok else []
-    except Exception:
-        records = []
-
-    all_keywords = []
-    for r in records:
-        all_keywords.extend(r.get("keywords", []))
-    unique_kws = list(dict.fromkeys(all_keywords))
-
-    # 手动添加知识点
-    col_add1, col_add2 = st.columns([4, 1])
-    with col_add1:
-        extra_kw = st.text_input("手动添加知识点到图谱", placeholder="输入知识点名称，回车添加")
-    with col_add2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        add_btn = st.button("➕ 添加", use_container_width=True)
-    
-    if "extra_kws" not in st.session_state:
-        st.session_state.extra_kws = []
-    if add_btn and extra_kw.strip():
-        if extra_kw.strip() not in st.session_state.extra_kws:
-            st.session_state.extra_kws.append(extra_kw.strip())
-            st.rerun()
-    
-    # 合并自动+手动的知识点
-    all_keywords = all_keywords + st.session_state.extra_kws
-    unique_kws = list(dict.fromkeys(all_keywords))
-    if not unique_kws:
-        st.info("还没有学习记录，完成几道题后这里会自动生成知识点思维导图～")
-    else:
-        nodes = [{"name": "智能学习平台", "symbolSize": 70, "itemStyle": {"color": accent}, "label": {"fontSize": 14, "fontWeight": "bold"}}]
-        links = []
-
-        question_map = {}
-        for r in records[-15:]:
-            q = r.get("question", "")[:12] or "其他"
-            kws = r.get("keywords", [])
-            if q not in question_map:
-                question_map[q] = set()
-            question_map[q].update(kws)
-
-        added_kws = set()
-        for q, kws in list(question_map.items())[:8]:
-            nodes.append({"name": q, "symbolSize": 45, "itemStyle": {"color": "#a855f7"}, "label": {"fontSize": 11}})
-            links.append({"source": "智能学习平台", "target": q})
-            for kw in list(kws)[:4]:
-                if kw not in added_kws:
-                    nodes.append({"name": kw, "symbolSize": 28, "itemStyle": {"color": "#f59e0b"}, "label": {"fontSize": 10}})
-                    added_kws.add(kw)
-                links.append({"source": q, "target": kw})
-
-        mind_html = f"""
-        <div id="mind_chart" style="width:100%;height:520px;"></div>
+    extra_key = f"extra_topics_{course_id or st.session_state.session_id}"
+    extra_topics = st.session_state.setdefault(extra_key, [])
+    extra_col, action_col = st.columns([4, 1])
+    with extra_col:
+        extra = st.text_input("手动添加知识点到本次导图", max_chars=100, key="extra_topic")
+    with action_col:
+        st.write("")
+        if st.button("➕ 添加", key="add_graph_topic") and extra.strip() and extra.strip() not in extra_topics:
+            extra_topics.append(extra.strip())
+    nodes = [{"id": "root", "name": course["name"] if course else "当前会话", "symbolSize": 62,
+              "itemStyle": {"color": accent}}]
+    links = []
+    topics_in_graph = [{"id": item["id"], "name": item["name"]} for item in topic_stats]
+    topics_in_graph += [{"id": f"manual-{i}", "name": name} for i, name in enumerate(extra_topics)]
+    if legacy_records:
+        topics_in_graph.append({"id": "legacy", "name": f"待归类 · {len(legacy_records)} 条"})
+    for topic in topics_in_graph:
+        nodes.append({**topic, "symbolSize": 34, "itemStyle": {"color": "#f59e0b"}})
+        links.append({"source": "root", "target": topic["id"]})
+    if topics_in_graph:
+        components.html(f"""
+        <div id="mind_chart" style="width:100%;height:480px;"></div>
         <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
         <script>
         var chart = echarts.init(document.getElementById('mind_chart'));
-        chart.resize();
         window.addEventListener('resize', function(){{ chart.resize(); }});
         chart.setOption({{
-            backgroundColor: 'transparent',
-            tooltip: {{}},
-            series: [{{
-                type: 'graph',
-                layout: 'force',
-                roam: true,
-                draggable: true,
-                force: {{ repulsion: 500, gravity: 0.05, edgeLength: 200 }},
-                label: {{ show: true, color: '{text_color}', fontSize: 12 }},
-                lineStyle: {{ color: '{_hex_to_rgba(accent, 0.4)}', width: 2 }},
-                nodes: {json.dumps(nodes, ensure_ascii=False)},
-                links: {json.dumps(links, ensure_ascii=False)}
-            }}]
+            series: [{{type: 'graph', layout: 'force', roam: true, draggable: true,
+                      force: {{repulsion: 500, edgeLength: 160}},
+                      label: {{show: true, color: '{text_color}'}},
+                      data: {_js_data(nodes)}, links: {_js_data(links)}}}]
         }});
         </script>
-        """
-        components.html(mind_html, height=540)
-        st.caption("💡 节点可以拖动，滚轮缩放。完成的题目越多，图谱越丰富。")
+        """, height=500)
+    else:
+        st.info("完成一道测验后，这里会显示练习过的知识点。")
 
 # ==================== Tab6：资料库 ====================
 with tab6:
@@ -1377,3 +1304,65 @@ with tab6:
                 "💡 浏览器自带的 PDF 阅读器：可以缩放、翻页、搜索，右上角也能直接下载。"
                 "打不开时 [在新标签页打开](%s)。" % preview_url
             )
+
+# ==================== Tab7：复习路径 ====================
+with tab7:
+    st.subheader("🗓️ 复习路径")
+    if course:
+        st.write(course["name"])
+        if course["goal"]:
+            st.caption(f"学习目标 · {course['goal']}")
+        review_path = f"/courses/{quote(course_id, safe='')}/review"
+        review = _edge_get(edge_url, review_path)
+        if not review or review.get("status") != "success":
+            st.info("暂时无法读取复习计划。")
+        else:
+            tasks = review["tasks"]
+            st.caption(f"当前待练 {sum(task['due_now'] for task in tasks)} 项 · 共 {len(tasks)} 个知识点")
+            for task in tasks:
+                topic = task["id"]
+                label = "待复习" if task["due_now"] else "已安排"
+                with st.expander(f"{label} · {task['name']}"):
+                    st.write(task["reason"])
+                    st.caption(f"已练 {task['total']} 次 · 通过 {task['passed']} 次")
+                    if task["due"]:
+                        st.caption(f"复习时间 · {task['due'][:16].replace('T', ' ')}")
+                    primary, secondary, tertiary = st.columns(3)
+                    if primary.button("进入练习", key=f"plan_practice_{topic}"):
+                        payload = ({"retry_quiz_id": task["last_quiz_id"]} if task["last_quiz_id"]
+                                   else {"course_id": course_id, "topic_id": topic})
+                        _queue_practice(payload, course_id)
+                    action = None
+                    if secondary.button("标记完成", key=f"plan_done_{topic}"):
+                        action = "done"
+                    if tertiary.button("明天再练", key=f"plan_snooze_{topic}"):
+                        action = "snooze"
+                    if action:
+                        result = _study_post(edge_url, review_path, {"topic_id": topic, "action": action})
+                        if result["status"] == "success":
+                            st.rerun()
+                        st.error(result["message"])
+    else:
+        st.info("在上方选择课程以查看复习计划，或在下方创建课程。")
+
+    with st.expander("课程设置", expanded=not bool(courses)):
+        edit = bool(course) and st.checkbox("编辑当前课程", key="edit_course")
+        existing = course if edit else {}
+        current_sources = [d["name"] for d in (documents or []) if d.get("indexed")]
+        source_names = list(dict.fromkeys([*current_sources, *existing.get("sources", [])]))
+        with st.form(f"course_form_{existing.get('id', 'new')}"):
+            name = st.text_input("课程名称", value=existing.get("name", ""), max_chars=100)
+            goal = st.text_area("学习目标", value=existing.get("goal", ""), max_chars=500)
+            sources = st.multiselect("课程资料", source_names, default=existing.get("sources", []),
+                                     help="可选择多份课件。未选择课件时，课程练习使用通用题。")
+            names = st.text_area("知识点（每行一个）", value="\n".join(t["name"] for t in existing.get("topics", [])),
+                                 help="编辑时保留已有知识点名称，可在末尾添加新的知识点。")
+            saved = st.form_submit_button("保存课程")
+        if saved:
+            result = _study_post(edge_url, "/courses", {"course_id": existing.get("id"), "name": name,
+                                 "goal": goal, "sources": sources, "topics": names.splitlines()})
+            if result["status"] == "success":
+                st.session_state.next_study_course = result["course"]["id"]
+                st.session_state.next_study_tab = "🗓️ 复习路径"
+                st.rerun()
+            st.error(result["message"])

@@ -19,6 +19,9 @@ local_secrets.py
 # chroma_db.bak-*/  rebuild_index.py 重建前的备份
 chat_db.json
 learning_db.json
+learning_db.json.tmp
+study_db.json
+study_db.json.tmp
 ui_settings.json
 documents_db.json
 documents_db.json.tmp
