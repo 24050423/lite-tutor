@@ -39,8 +39,8 @@ def _build_quiz(question: str, context: Optional[str] = None, n_results: int = 2
                 source: Optional[str] = None):
     working_context = context.strip() if context else ""
     if not working_context:
-        working_context = rag_db.query_knowledge_hybrid(question, n_results=n_results,
-                                                        source=source)
+        chunks, _ = rag_db.search_chunks(question, n_results=n_results, source=source)
+        working_context = "\n---\n".join(chunks)
 
     # 用LLM生成高质量题目
     try:
@@ -273,31 +273,14 @@ class SearchRequest(BaseModel):
 
 @app.post("/search")
 async def search_knowledge(req: SearchRequest):
-    print("\n" + "="*60)
-    print(f"[SEARCH RECEIVED] Query: {req.query}")
     try:
-        documents, distances = rag_db.query_knowledge_chunks_with_scores(req.query, n_results=req.n_results)
-        confidence = 0.0
-        if distances:
-            confidence = 1.0 / (1.0 + distances[0])
-        threshold = float(os.getenv("RAG_CONF_THRESHOLD", "0.35"))
-        fallback_required = (not documents) or (confidence < threshold)
-        if fallback_required:
-            return {
-                "status": "success",
-                "context": "",
-                "fallback_required": True,
-                "confidence": confidence
-            }
-        if req.mode.lower() == "vector":
-            retrieved_context = "\n---\n".join(documents)
-        else:
-            retrieved_context = rag_db.query_knowledge_hybrid(req.query, n_results=req.n_results)
-        print(f"[SEARCH RESULT] Found {len(retrieved_context)} characters of context.")
+        documents, confidence = rag_db.search_chunks(
+            req.query, n_results=req.n_results, mode=req.mode,
+        )
         return {
-            "status": "success", 
-            "context": retrieved_context,
-            "fallback_required": False,
+            "status": "success",
+            "context": "\n---\n".join(documents),
+            "fallback_required": not documents,
             "confidence": confidence
         }
     except Exception as e:

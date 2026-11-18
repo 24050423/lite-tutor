@@ -14,6 +14,7 @@ import uuid
 # 现在中文切二元组（计算/算机/机硬/硬件…），英文数字仍按词切，两边才有交集。
 _CJK = "一-鿿㐀-䶿"
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[" + _CJK + "]+")
+_DOTTED_NUMBER_RE = re.compile(r"(?<![a-zA-Z0-9_])(?:v)?\d+(?:\.\d+)+(?![a-zA-Z0-9_]|\.\d)", re.IGNORECASE)
 
 
 def tokenize(text) -> list:
@@ -146,66 +147,61 @@ class LocalRAGKnowledgeBase:
         )
         print("[SUCCESS] Ingestion complete!")
 
-    def _tokenize(self, text: str):
-        return tokenize(text)
+    @staticmethod
+    def _keyword_tokens(text: str) -> set[str]:
+        # 题号 2.6.8 和 2.6.9 要区分，同时保留已有向量索引的分词规则。
+        identifiers = _DOTTED_NUMBER_RE.findall(text.lower())
+        return set(tokenize(_DOTTED_NUMBER_RE.sub(" ", text))) | set(identifiers)
 
     def _where(self, source):
         """把「只在这份资料里检索」翻译成 Chroma 的 where 条件；不限定时返回 None。"""
         return {"source": source} if source else None
 
     def _keyword_scores(self, query_text: str, source=None):
-        where = self._where(source)
-        all_docs = self.collection.get(
-            include=["documents"], **({"where": where} if where else {})
-        ).get("documents", [])
-        query_tokens = set(self._tokenize(query_text))
+        query_tokens = self._keyword_tokens(query_text)
+        if not query_tokens:
+            return []
+        all_docs = self.collection.get(include=["documents"], where=self._where(source))["documents"]
         scores = []
-        for doc in all_docs:
-            doc_tokens = set(self._tokenize(doc))
-            score = len(query_tokens & doc_tokens)
-            if score > 0:
-                scores.append((doc, score))
+        for doc in all_docs or []:
+            if not doc or doc.startswith("__fingerprint__"):
+                continue
+            matches = query_tokens & self._keyword_tokens(doc)
+            if matches:
+                scores.append((doc, len(matches) / len(query_tokens)))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
 
-    def query_knowledge_chunks(self, query_text: str, n_results: int = 2, source=None):
-        print(f"\n[SEARCH] Querying knowledge base for: '{query_text}'")
-        where = self._where(source)
+    def _vector_distances(self, query_text: str, n_results: int, source=None):
+        where = {"type": {"$ne": "fingerprint"}}
+        if source:
+            where = {"$and": [where, self._where(source)]}
         try:
-            kwargs = {"query_texts": [query_text], "n_results": n_results}
-            if where:
-                kwargs["where"] = where
-            results = self.collection.query(**kwargs)
-            docs = results.get("documents", [[]])[0]
-            # 指纹标记是「这份文件已导过」的书签，不是正文。以前 query 根本走不通，
-            # 它没机会露面；现在向量召回真的生效了，资料片数一少它就可能挤进结果里，
-            # 得挡掉——不然模型会把一串 md5 当成课件内容。
-            return [d for d in docs if not d.startswith("__fingerprint__")]
-        except Exception as e:
-            print(f"[SEARCH] query失败，降级到关键词搜索：{e}")
-            # 降级：直接全量关键词匹配
-            scores = self._keyword_scores(query_text, source)
-            return [d for d, _ in scores[:n_results]]
+            results = self.collection.query(
+                query_texts=[query_text], n_results=n_results, where=where,
+                include=["documents", "distances"],
+            )
+        except Exception as exc:
+            print(f"[SEARCH] 向量检索失败：{type(exc).__name__}")
+            return None
+        return [
+            (doc, distance)
+            for doc, distance in zip(results["documents"][0], results["distances"][0])
+            if doc and not doc.startswith("__fingerprint__")
+        ]
+
+    def query_knowledge_chunks(self, query_text: str, n_results: int = 2, source=None):
+        candidates = self._vector_distances(query_text, n_results, source)
+        if candidates is None:
+            candidates = self._keyword_scores(query_text, source)[:n_results]
+        return [doc for doc, _ in candidates]
 
     def query_knowledge_chunks_with_scores(self, query_text: str, n_results: int = 2, source=None):
-        print(f"\n[SEARCH] Querying knowledge base for: '{query_text}'")
-        where = self._where(source)
-        try:
-            kwargs = {
-                "query_texts": [query_text],
-                "n_results": n_results,
-                "include": ["documents", "distances"],
-            }
-            if where:
-                kwargs["where"] = where
-            results = self.collection.query(**kwargs)
-            documents = results.get("documents", [[]])[0]
-            distances = results.get("distances", [[]])[0]
-            return documents, distances
-        except Exception as e:
-            print(f"[SEARCH] query失败，降级：{e}")
-            docs = self.query_knowledge_chunks(query_text, n_results, source)
-            return docs, [0.5] * len(docs)
+        candidates = self._vector_distances(query_text, n_results, source)
+        if candidates is None:
+            candidates = [(doc, 1.0 / score - 1.0)
+                          for doc, score in self._keyword_scores(query_text, source)[:n_results]]
+        return [doc for doc, _ in candidates], [distance for _, distance in candidates]
 
     def query_knowledge(self, query_text: str, n_results: int = 2, source=None) -> str:
         chunks = self.query_knowledge_chunks(query_text, n_results, source)
@@ -213,23 +209,34 @@ class LocalRAGKnowledgeBase:
             return "No relevant context found in the local knowledge base."
         return "\n---\n".join(chunks)
 
-    def query_knowledge_hybrid(self, query_text: str, n_results: int = 2, source=None) -> str:
-        """向量召回 + 关键词召回，融合排序后取前 n_results 片。
+    def search_chunks(self, query_text: str, n_results: int = 2, source=None,
+                      *, mode: str = "hybrid") -> tuple[list[str], float]:
+        """独立召回向量和关键词候选，再按名次融合已过门槛的片段。"""
+        if n_results < 1 or not query_text.strip():
+            return [], 0.0
 
-        source 传了资料名就只在那份资料里检索（出题时选「从哪份资料出题」用的）。
-        """
-        vector_chunks = self.query_knowledge_chunks(query_text, n_results * 2, source)
-        keyword_scores = self._keyword_scores(query_text, source)
-        combined = {}
-        for idx, doc in enumerate(vector_chunks):
-            combined[doc] = combined.get(doc, 0) + (1.0 / (idx + 1))
-        for rank, (doc, score) in enumerate(keyword_scores[: n_results * 4]):
-            combined[doc] = combined.get(doc, 0) + score + (0.5 / (rank + 1))
-        if not combined:
+        threshold = float(os.getenv("RAG_CONF_THRESHOLD", "0.35"))
+        hybrid = mode.lower() != "vector"
+        limit = n_results * 2 if hybrid else n_results
+        distances = self._vector_distances(query_text, limit, source)
+        vector = [(doc, 1.0 / (1.0 + distance)) for doc, distance in distances or []]
+        keywords = self._keyword_scores(query_text, source)[:limit] if hybrid or distances is None else []
+        confidence = max((score for _, score in keywords + vector), default=0.0)
+
+        # 两路分数的含义不同。用倒数排名融合，同一片段每路只计一次。
+        combined: dict[str, float] = {}
+        for candidates in (keywords, vector):
+            qualified = dict.fromkeys(doc for doc, score in candidates if score >= threshold)
+            for rank, doc in enumerate(qualified, start=1):
+                combined[doc] = combined.get(doc, 0.0) + 1.0 / (60 + rank)
+        ranked = sorted(combined, key=combined.__getitem__, reverse=True)
+        return ranked[:n_results], confidence
+
+    def query_knowledge_hybrid(self, query_text: str, n_results: int = 2, source=None) -> str:
+        chunks, _ = self.search_chunks(query_text, n_results, source)
+        if not chunks:
             return "No relevant context found in the local knowledge base."
-        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-        top_docs = [doc for doc, _ in ranked[:n_results]]
-        return "\n---\n".join(top_docs)
+        return "\n---\n".join(chunks)
 
     def add_document(self, text: str, source: str = "uploaded") -> bool:
         """动态添加文档到知识库，返回False表示已存在"""
