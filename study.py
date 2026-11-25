@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from vendor.deeptutor.services.practice.scheduler import schedule
 
 PASS_SCORE = 75
 POINTS = {"met": 1.0, "partial": 0.5, "missed": 0.0}
@@ -72,24 +73,6 @@ def quiz_rubric(reply: dict) -> list[dict]:
     return valid
 
 
-def grade_rows(reply: dict, rubric: list[dict]) -> list[dict]:
-    raw = reply.get("items")
-    if not isinstance(raw, list) or len(raw) != len(rubric):
-        raise ValueError("评分项数量不匹配")
-    marks = {}
-    valid = {item["id"] for item in rubric}
-    for row in raw:
-        if not isinstance(row, dict):
-            raise ValueError("评分项格式无效")
-        criterion, mark, explanation = row.get("id"), row.get("status"), row.get("explanation")
-        if (not isinstance(criterion, str) or criterion not in valid or criterion in marks
-                or not isinstance(mark, str) or mark not in POINTS
-                or not isinstance(explanation, str) or not explanation.strip()):
-            raise ValueError("评分项无法对应题目要点")
-        marks[criterion] = {"status": mark, "explanation": explanation.strip()[:500]}
-    return [{**item, **marks[item["id"]]} for item in rubric]
-
-
 def keyword_rows(answer: str, rubric: list[dict]) -> list[dict]:
     text = normalized(answer)
     rows = []
@@ -130,15 +113,15 @@ def review_queue(course: dict, attempts: list[dict], progress: dict, now: dateti
         if not latest:
             due, reason, priority = None, "还没有练习记录", 1
         else:
-            attempted_at = datetime.fromisoformat(latest["timestamp"])
+            state = {}
+            for record in history:
+                rating = "good" if record["result"] == "校验通过" else "again"
+                state = schedule(state, rating, datetime.fromisoformat(record["timestamp"]).timestamp())
+            due = datetime.fromtimestamp(state["due_at"])
             if latest["result"] != "校验通过":
-                due, reason, priority = attempted_at, "上次练习未通过", 0
+                reason, priority = "上次练习未通过，安排短间隔复习", 0
             else:
-                recent = history[-3:]
-                weak = any(item["result"] != "校验通过" for item in recent)
-                due = attempted_at + timedelta(days=1 if weak else 3)
-                reason = "近期有错题，间隔 1 天再练" if weak else "近期练习顺利，间隔 3 天复习"
-                priority = 1 if weak else 2
+                reason, priority = f"上次练习通过，间隔 {state['interval_days']:g} 天复习", 2
         marker = progress.get(topic_id) or {}
         if marker.get("at") and marker.get("quiz_id") == quiz_id:
             at = datetime.fromisoformat(marker["at"])

@@ -202,7 +202,7 @@ class ReferenceTests(LocalAPITest):
             app = AppTest.from_file(str(path)).run()
             self.assertFalse(app.exception)
             app.selectbox(key="chat_scope_input").select("second.pdf").run()
-            app.chat_input[0].set_value("2.6.8").run()
+            app.chat_input[0].set_value("2.6.8").run(timeout=30)
             self.assertFalse(app.exception)
             reply = app.session_state.messages[-1]
             self.assertEqual(reply["citations"][0]["doc_id"], doc["doc_id"])

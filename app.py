@@ -427,6 +427,8 @@ def _render_grade(record: dict) -> None:
         st.caption("评分方式 · 模型逐项评分")
     elif record.get("grading_method") == "keyword":
         st.caption("评分方式 · 关键词匹配")
+    elif record.get("grading_method") == "choice":
+        st.caption("评分方式 · 按标准选项判分")
     labels = {"met": "✅ 达到", "partial": "🟡 部分达到", "missed": "❌ 未达到"}
     for item in record.get("items", []):
         st.markdown(f"**{labels[item['status']]} · {item['keyword']}**")
@@ -960,7 +962,7 @@ with tab2:
         pending = quiz_request
     if pending is not None:
         with st.spinner("正在准备题目…"):
-            result = _study_post(edge_url, "/quiz", {"n_results": 4, **pending}, timeout=55)
+            result = _study_post(edge_url, "/quiz", {"n_results": 4, "question_type": "auto", **pending}, timeout=55)
         if result["status"] == "success":
             st.session_state.active_practice = result
             st.session_state.current_question = result.get("topic") or pending.get("question", "")
@@ -996,7 +998,11 @@ with tab2:
         quiz_id = quiz.get("quiz_id") or "legacy"
         if grade is None:
             with st.form("answer_form"):
-                answer = st.text_area("你的回答", key=f"answer_{quiz_id}", height=120, max_chars=12000)
+                if options := quiz.get("options"):
+                    answer = st.radio("选择一个答案", list(options), index=None, key=f"choice_{quiz_id}",
+                                      format_func=lambda label: f"{label}. {options[label]}") or ""
+                else:
+                    answer = st.text_area("你的回答", key=f"answer_{quiz_id}", height=120, max_chars=12000)
                 submitted = st.form_submit_button("✅ 提交答案")
             if submitted:
                 if not answer.strip():

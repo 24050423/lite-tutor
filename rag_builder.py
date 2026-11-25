@@ -8,6 +8,9 @@ import urllib.request
 import urllib.error
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+
+from deeptutor_adapter import rank_chunks
 
 # ── 分词 ────────────────────────────────────────────────────
 # 中文没有空格，早先那句 re.split(r"[^a-zA-Z0-9一-鿿]+") 会把整句话切成一个 token，
@@ -110,7 +113,8 @@ class LocalRAGKnowledgeBase:
     # 项目已更名为「智能学习平台」，但此处保持原名以兼容既有 chroma_db 数据。
     def __init__(self, db_path="./chroma_db", collection_name="lite_tutor_kb"):
         print("[SYSTEM] Initializing Local Vector Database...")
-        self.client = chromadb.PersistentClient(path=os.path.abspath(db_path))
+        self.db_path = Path(db_path).resolve()
+        self.client = chromadb.PersistentClient(path=str(self.db_path))
         mode = (os.getenv("TUTOR_OFFLINE") or os.getenv("LITETUTOR_OFFLINE") or "auto").strip().lower()
         force_offline = mode in {"1", "true", "yes", "offline"}
         force_online = mode in {"0", "false", "no", "online"}
@@ -276,17 +280,18 @@ class LocalRAGKnowledgeBase:
         where = self._search_where(source, published)
         distances = self._vector_hits(query_text, limit, where)
         vector = [(hit, 1.0 / (1.0 + distance)) for hit, distance in distances or []]
-        keywords = self._keyword_hits(query_text, where)[:limit] if hybrid or distances is None else []
+        keywords = self._keyword_hits(query_text, where) if hybrid or distances is None else []
         confidence = max((score for _, score in keywords + vector), default=0.0)
 
-        # 两路分数的含义不同。用倒数排名融合，同一片段每路只计一次。
-        combined: dict[SearchHit, float] = {}
-        for candidates in (keywords, vector):
-            qualified = dict.fromkeys(hit for hit, score in candidates if score >= threshold)
-            for rank, hit in enumerate(qualified, start=1):
-                combined[hit] = combined.get(hit, 0.0) + 1.0 / (60 + rank)
-        ranked = sorted(combined, key=combined.__getitem__, reverse=True)
-        return SearchResult(ranked[:n_results], confidence, keyword_only=distances is None)
+        hits = {hit.chunk_id: hit for hit, score in vector + keywords if score >= threshold}
+        lexical = {hit.chunk_id: " ".join(sorted(self._keyword_tokens(hit.text)))
+                   for hit, score in keywords if score >= threshold}
+        ranked = rank_chunks(
+            " ".join(sorted(self._keyword_tokens(query_text))),
+            [(hit.chunk_id, score) for hit, score in vector if score >= threshold],
+            lexical, n_results, self.db_path / "deeptutor-search",
+        )
+        return SearchResult([hits[key] for key in ranked], confidence, keyword_only=distances is None)
 
     def search_chunks(self, query_text: str, n_results: int = 2, source=None,
                       *, mode: str = "hybrid") -> tuple[list[str], float]:
